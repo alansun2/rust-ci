@@ -128,8 +128,8 @@ pub fn get_module_port(module: &str) -> u16 {
 }
 
 /// 获取模块对应的服务名（Eureka 注册名）
-pub fn get_module_service_name(module: &str) -> &'static str {
-    match module {
+pub fn get_module_service_name(module: &str) -> String {
+    let s: &str = match module {
         "declaration-server" => "declaration-service",
         "addr-server" => "address-service",
         "setting-server" => "setting-server",
@@ -144,7 +144,8 @@ pub fn get_module_service_name(module: &str) -> &'static str {
         "file-sy-server" => "file-service",
         "kt-util" => "kt-util",
         other => other,
-    }
+    };
+    s.to_string()
 }
 
 /// 根据环境获取 Eureka URL
