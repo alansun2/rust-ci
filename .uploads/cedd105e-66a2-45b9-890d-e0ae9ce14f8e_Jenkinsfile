@@ -1,0 +1,809 @@
+properties([
+        parameters([
+                [$class    : 'ChoiceParameter',
+                 name      : 'MODULE',
+                 choiceType: 'PT_SINGLE_SELECT',
+                 filterable: true,
+                 script    : [$class        : 'GroovyScript',
+                              script        : [sandbox: true, script: '''
+              return [
+                  'declaration-server', 'addr-server', 'setting-server', 'message-server',
+                  'warehouse-server', 'operation-data', 'hscode-server', 'category-server',
+                  'waybill', 'sysafariview-server', 'job-allocation', 'file-sy-server', 'kt-util'
+              ]
+          '''],
+                              fallbackScript: [sandbox: true, script: 'return []']
+                 ]
+                ],
+
+                [$class    : 'ChoiceParameter',
+                 name      : 'ENVIRONMENT',
+                 choiceType: 'PT_SINGLE_SELECT',
+                 script    : [$class        : 'GroovyScript',
+                              script        : [sandbox: true, script: "return ['test', 'dev', 'pro']"],
+                              fallbackScript: [sandbox: true, script: "return ['test']"]
+                 ]
+                ],
+
+                [$class      : 'StringParameterDefinition',
+                 name        : 'VERSION',
+                 description : '构建版本号(可手动输入)',
+                 defaultValue: 'develop'
+                ],
+
+                [$class              : 'CascadeChoiceParameter',
+                 name                : 'BUILD_METHOD',
+                 choiceType          : 'PT_SINGLE_SELECT',
+                 referencedParameters: 'ENVIRONMENT',
+                 script              : [$class        : 'GroovyScript',
+                                        script        : [sandbox: true, script: '''
+                                            if (ENVIRONMENT == "pro") {
+                                                return ["github-actions", "local"]
+                                            }
+                                            return ["local", "github-actions"]
+                                        '''],
+                                        fallbackScript: [sandbox: true, script: 'return ["local", "github-actions"]']
+                 ]
+                ],
+
+                [$class    : 'ChoiceParameter',
+                 name      : 'TRIGGER_TYPE',
+                 choiceType: 'PT_SINGLE_SELECT',
+                 script    : [$class        : 'GroovyScript',
+                              script        : [sandbox: true, script: "return ['manual', 'tag']"],
+                              fallbackScript: [sandbox: true, script: "return ['manual']"]
+                 ]
+                ],
+
+                [$class              : 'CascadeChoiceParameter',
+                 name                : 'ALWAYS_PULL_IMAGE',
+                 choiceType          : 'PT_SINGLE_SELECT',
+                 referencedParameters: 'ENVIRONMENT',
+                 script              : [$class        : 'GroovyScript',
+                                        script        : [sandbox: true, script: '''
+                    return ENVIRONMENT == "test" ? ["true", "false"] : ["true", "false"]
+                  '''],
+                                        fallbackScript: [sandbox: true, script: 'return ["true", "false"]']
+                 ]
+                ],
+
+                [$class              : 'CascadeChoiceParameter',
+                 name                : 'SERVER_HOST',
+                 description         : '服务器主机地址',
+                 choiceType          : 'PT_SINGLE_SELECT',
+                 referencedParameters: 'ENVIRONMENT',
+                 script              : [$class        : 'GroovyScript',
+                                        script        : [sandbox: true, script: '''
+              if (ENVIRONMENT == "pro") {
+                  return ["mq.pro.asl.com", "vault.pro.asl.com", "env.pro.asl.com", "basic.pro.asl.com", "ser.pro.asl.com"]
+              }
+              if (ENVIRONMENT == "dev") {
+                  return ["thinkserver-asl"]
+              }
+              return ["env.dev.asl.com", "ser.dev.asl.com"]
+          '''],
+                                        fallbackScript: [sandbox: true, script: 'return ["env.dev.asl.com"]']
+                 ]
+                ],
+
+                [$class              : 'CascadeChoiceParameter',
+                 name                : 'USE_ROLLING_UPDATE',
+                 description         : '是否使用滚动更新',
+                 choiceType          : 'PT_SINGLE_SELECT',
+                 referencedParameters: 'ENVIRONMENT',
+                 script              : [$class        : 'GroovyScript',
+                                        script        : [sandbox: true, script: '''
+                                    // 列表首项为默认值: pro 默认 true(是), test 默认 false(否)
+                                    return ENVIRONMENT == "pro" ? ["true", "false"] : ["false", "true"]
+                                  '''],
+                                        fallbackScript: [sandbox: true, script: 'return ["false", "true"]']
+                 ]
+                ],
+
+                [$class              : 'CascadeChoiceParameter',
+                 name                : 'SERVER_B_HOST',
+                 description         : '服务器B主机地址，用于滚动更新',
+                 choiceType          : 'PT_SINGLE_SELECT',
+                 referencedParameters: 'USE_ROLLING_UPDATE',
+                 script              : [$class        : 'GroovyScript',
+                                        script        : [sandbox: true, script: '''
+                                          if (USE_ROLLING_UPDATE != "true") {
+                                              return ["N/A"]
+                                          }
+                                          return ["ser.pro.asl.com", "env.pro.asl.com", "basic.pro.asl.com", "vault.pro.asl.com", "env.dev.asl.com", "ser.dev.asl.com"]
+                                      '''],
+                                        fallbackScript: [sandbox: true, script: 'return ["N/A"]']
+                 ]
+                ],
+
+                [$class      : 'StringParameterDefinition',
+                 name        : 'WAIT_TIME_AFTER_DOWN',
+                 description : '下线后等待时间(秒)，留空则按环境/服务自动计算默认值',
+                 defaultValue: ''
+                ]
+        ])
+])
+
+// 各阶段耗时记录(跨 stage 共享, 声明式 pipeline 块内不允许 def, 必须定义在其之前)
+def STAGE_DURATIONS = [:]
+
+pipeline {
+    agent any
+
+    environment {
+        GITHUB_REPO = 'sysafari-server'
+        GITHUB_OWNER = 'ASL-Dutch'
+        PIPELINE_START = "${new Date().time}"
+    }
+
+    stages {
+        //        stage('Checkout') {
+        //            steps {
+        //                checkout scm
+        //                script {
+        //                    def currentBranch = env.BRANCH_NAME
+        //                    echo "========================================="
+        //                    echo "Build Information"
+        //                    echo "========================================="
+        //                    echo "Branch: ${currentBranch}"
+        //                    echo "Module: ${params.MODULE}"
+        //                    echo "Version: ${params.VERSION}"
+        //                    echo "Trigger Type: ${params.TRIGGER_TYPE}"
+        //                    echo "Commit: ${env.GIT_COMMIT?.take(7) ?: 'N/A'}"
+        //                    echo "========================================="
+        //                    env.BRANCH_NAME = currentBranch
+        //                }
+        //            }
+        //        }
+
+        stage('Trigger GitHub Actions') {
+            when {
+                allOf {
+                    expression { params.TRIGGER_TYPE == 'manual' }
+                    expression { params.BUILD_METHOD == 'github-actions' }
+                }
+            }
+            steps {
+                script {
+                    this.timedStage(STAGE_DURATIONS, 'Trigger GitHub Actions') {
+                        echo "Triggering GitHub Actions for complete build process..."
+
+                        if (params.TRIGGER_TYPE == 'manual') {
+                            def runInfo = triggerGithubWorkflowDispatch()
+                            env.GH_ACTION_RUN_ID = runInfo.runId
+                            env.GH_ACTION_RUN_URL = runInfo.runUrl
+                        } else {
+                            createAndPushTag()
+                        }
+                    }
+                }
+            }
+            post {
+                success {
+                    echo "✅ GitHub Actions triggered successfully! Run ID: ${env.GH_ACTION_RUN_ID ?: 'N/A'}"
+                    echo "Run URL: ${env.GH_ACTION_RUN_URL ?: 'N/A'}"
+                }
+                failure {
+                    error "❌ Failed to trigger GitHub Actions. Please check credentials and permissions."
+                }
+            }
+        }
+
+        stage('Local Build') {
+            when {
+                expression { params.BUILD_METHOD == 'local' }
+            }
+            steps {
+                script {
+                    this.timedStage(STAGE_DURATIONS, 'Local Build') {
+                        echo "Building locally: module=${params.MODULE}, version=${params.VERSION}"
+                        def imageTag = getImage()
+                        def registryHost = imageTag.split('/')[0]
+
+                        withCredentials([
+                                usernamePassword(credentialsId: 'repo-asl', usernameVariable: 'MVN_USERNAME', passwordVariable: 'MVN_PASSWORD'),
+                                usernamePassword(credentialsId: 'ALIYUN_DOCKER_CREDENTIALS', usernameVariable: 'DOCKER_USERNAME', passwordVariable: 'DOCKER_PASSWORD')
+                        ]) {
+                            // 1. 用 Docker 镜像跑 Maven(本地无需安装 mvn)
+                            // 关键: agent 自身在容器内, docker-from-docker 的 -v bind mount 源路径由宿主机 daemon 解析,
+                            // 容器内 workspace 路径在宿主机上不存在, 挂进去是空目录(之前 settings file does not exist 的根因)
+                            // 方案: 源码用 tar 流经 stdin 传入容器, 产物 tar 流传回; 依赖缓存用命名卷(daemon 管理, 无路径问题)
+                            // settings.xml 用 heredoc(单引号 EOF)生成, \${env.XXX} 以字面量写入, Maven 从容器环境变量解析, 凭据不进日志
+                            def mvnStatus = sh(
+                                    returnStatus: true,
+                                    script: """\
+                                    set -e
+                                    cat > docker-mvn-settings.xml <<'EOF'
+                                    <settings>
+                                      <servers>
+                                        <server>
+                                          <id>repo-asl</id>
+                                          <username>\${env.MVN_USERNAME}</username>
+                                          <password>\${env.MVN_PASSWORD}</password>
+                                        </server>
+                                      </servers>
+                                      <mirrors>
+                                        <mirror>
+                                          <id>aliyun-public</id>
+                                          <mirrorOf>central</mirrorOf>
+                                          <url>https://maven.aliyun.com/repository/public</url>
+                                        </mirror>
+                                      </mirrors>
+                                    </settings>
+                                    EOF
+                                    tar -cf build-src.tar --exclude=./build-src.tar --exclude=./build-out.tar --exclude=.git --exclude='*/target' --exclude=docker-context .
+                                    docker run --rm -i \\
+                                        -v sysafari-m2-cache:/root/.m2 \\
+                                        -w /build \\
+                                        -e MVN_USERNAME -e MVN_PASSWORD \\
+                                        maven:3.8-openjdk-8 \\
+                                        sh -c 'tar -xf - -C /build && mvn -B -s /build/docker-mvn-settings.xml clean package -DskipTests -pl ${params.MODULE} -am 1>&2 && tar -cf - ${params.MODULE}/target' \\
+                                        < build-src.tar > build-out.tar
+                                    tar -xf build-out.tar
+                                    rm -f build-src.tar build-out.tar
+                                    ls -l ${params.MODULE}/target/*.jar
+                                    """.stripIndent()
+                            )
+                            if (mvnStatus != 0) {
+                                error "❌ Maven build failed with exit code ${mvnStatus}, 请检查上方 docker/mvn 日志(镜像拉取失败、私服认证失败等都会在这里暴露)"
+                            }
+
+                            // 2. 准备 docker 构建上下文(与 GitHub Actions 步骤一致)
+                            sh """\
+                                rm -rf docker-context
+                                mkdir -p docker-context/target
+                                mv ${params.MODULE}/target/*.jar docker-context/target/app.jar
+                                cp ${params.MODULE}/Dockerfile docker-context/Dockerfile
+                                if [ -d ${params.MODULE}/fonts ]; then
+                                    cp -r ${params.MODULE}/fonts docker-context/fonts
+                                fi
+                            """.stripIndent()
+
+                            // 3. 登录阿里云镜像仓库并推送
+                            sh """\
+                                echo "\${DOCKER_PASSWORD}" | docker login -u "\${DOCKER_USERNAME}" --password-stdin ${registryHost}
+                                docker build -t ${imageTag} docker-context
+                                docker push ${imageTag}
+                            """.stripIndent()
+                        }
+
+                        echo "✅ Local build finished, image pushed: ${imageTag}"
+                    }
+                }
+            }
+            post {
+                success {
+                    echo "✅ Local build and push completed!"
+                }
+                failure {
+                    error "❌ Local build failed. Please check Maven/Docker logs."
+                }
+            }
+        }
+
+        stage('Monitor Build Status') {
+            when {
+                allOf {
+                    expression { params.TRIGGER_TYPE == 'manual' }
+                    expression { params.BUILD_METHOD == 'github-actions' }
+                }
+            }
+            steps {
+                script {
+                    this.timedStage(STAGE_DURATIONS, 'Monitor Build Status') {
+                        echo "Monitoring GitHub Actions build status..."
+                        echo "Polling interval: 15 seconds, Run ID: ${env.GH_ACTION_RUN_ID}"
+
+                        timeout(time: 60, unit: 'MINUTES') {
+                            waitForGithubActions(env.GH_ACTION_RUN_ID, env.GH_ACTION_RUN_URL)
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('Deploy') {
+            when {
+                expression { params.TRIGGER_TYPE == 'manual' }
+            }
+            steps {
+                script {
+                    this.timedStage(STAGE_DURATIONS, 'Deploy') {
+                        if (params.USE_ROLLING_UPDATE == 'true') {
+                            echo "Starting rolling deployment..."
+                            rollingDeploy()
+                        } else {
+                            echo "Starting single server deployment..."
+                            def serviceName = getModuleServiceName(params.MODULE)
+                            def serviceNameUp = serviceName.toUpperCase()
+                            def eurekaUrl = getEurekaUrl(params.ENVIRONMENT)
+                            deployAndVerify(params.SERVER_HOST, params.MODULE, serviceNameUp, eurekaUrl, 1)
+
+                            sleep time: 30, unit: 'SECONDS'
+                        }
+                    }
+                }
+            }
+            post {
+                success {
+                    echo "✅ Deployment completed successfully!"
+                }
+                failure {
+                    error "❌ Deployment failed. Please check logs and rollback if needed."
+                }
+            }
+        }
+    }
+
+    post {
+        always {
+            echo "Pipeline execution completed for ${params.MODULE} v${params.VERSION}"
+            script {
+                // 打印每个阶段的用时与总耗时(被 when 跳过的阶段不记录)
+                echo "========== 各阶段用时汇总 =========="
+                STAGE_DURATIONS.each { name, ms ->
+                    echo "⏱ ${name}: ${this.formatDuration(ms)}"
+                }
+                echo "⏱ 流水线总耗时(含调度): ${this.formatDuration(new Date().time - (env.PIPELINE_START as long))}"
+                echo "=================================="
+            }
+        }
+        success {
+            script {
+                def jenkinsUrl = env.BUILD_URL ?: 'N/A'
+                def image = getImage()
+                def message = """
+                                    # ✅ 构建CI/CD成功
+                                    > [Jenkins 详情](${jenkinsUrl})
+
+                                    ## 构建信息
+                                    - **Branch**: ${env.BRANCH_NAME}
+                                    - **Module**: ${params.MODULE}
+                                    - **Service**: ${getModuleServiceName(params.MODULE)}
+                                    - **Version**: ${params.VERSION}
+                                    - **Environment**: ${params.ENVIRONMENT}
+                                    - **Trigger**: ${params.TRIGGER_TYPE}
+                                    - **Build Method**: ${params.BUILD_METHOD}
+                                    - **Server User**: ${getServerUser()}
+                                    - **Server Host**: ${params.SERVER_HOST}
+                                    - **Rolling Update**: ${params.USE_ROLLING_UPDATE == 'true' ? '是' : '否'}
+                                    - **Server B Host**: ${params.SERVER_B_HOST}
+                                    - **Docker Image**: ${image}
+
+                                    ## Commit 信息
+                                    ${env.GIT_COMMIT?.take(7) ?: 'N/A'}
+                                    """
+                echo message
+                sendDingTalkNotification('success', message)
+            }
+        }
+        failure {
+            script {
+                def jenkinsUrl = env.BUILD_URL ?: 'N/A'
+                def message = """
+                                    # ❌ 构建CI/CD失败
+                                    ## 构建信息
+                                    - **Branch**: ${env.BRANCH_NAME}
+                                    - **Module**: ${params.MODULE}
+                                    - **Service**: ${getModuleServiceName(params.MODULE)}
+                                    - **Version**: ${params.VERSION}
+                                    - **Environment**: ${params.ENVIRONMENT}
+                                    - **Trigger**: ${params.TRIGGER_TYPE}
+                                    - **Build Method**: ${params.BUILD_METHOD}
+                                    - **Server User**: ${getServerUser()}
+                                    - **Server Host**: ${params.SERVER_HOST}
+                                    - **Rolling Update**: ${params.USE_ROLLING_UPDATE == 'true' ? '是' : '否'}
+                                    - **Server B Host**: ${params.SERVER_B_HOST}
+                                    
+                                    ## 请检查:
+                                    1. [Jenkins 详情](${jenkinsUrl})
+                                    2. [GitHub Actions](https://github.com/${env.GITHUB_OWNER}/${env.GITHUB_REPO}/actions)
+                                    """
+                echo message
+                sendDingTalkNotification('failure', message)
+            }
+        }
+    }
+}
+
+/**
+ * 包裹阶段主体逻辑, 记录并打印耗时(失败也会记录, 便于定位耗时瓶颈)
+ */
+def timedStage(Map durations, String name, Closure body) {
+    long start = new Date().time
+    try {
+        body.call()
+    } finally {
+        durations[name] = new Date().time - start
+        echo "⏱ 阶段[${name}] 耗时: ${this.formatDuration(durations[name])}"
+    }
+}
+
+def formatDuration(long ms) {
+    long seconds = Math.round(ms / 1000.0d)
+    seconds >= 60 ? "${seconds.intdiv(60)}分${seconds % 60}秒" : "${seconds}秒"
+}
+
+def triggerGithubWorkflowDispatch() {
+    def result = [:]
+
+    withCredentials([string(credentialsId: 'GITHUB_TOKEN', variable: 'GITHUB_TOKEN')]) {
+        def ghEnv = params.ENVIRONMENT == "dev" ? "test" : params.ENVIRONMENT
+        def body = """{"ref":"${env.BRANCH_NAME}","inputs":{"module":"${params.MODULE}","version":"${params.VERSION}","env":"${ghEnv}"}}"""
+
+        try {
+            def response = sh(
+                    returnStdout: true,
+                    script: """
+                    curl -s -L -X POST \\
+                        -H "Accept: application/vnd.github+json" \\
+                        -H "Authorization: Bearer \${GITHUB_TOKEN}" \\
+                        -H "X-GitHub-Api-Version: 2026-03-10" \\
+                        https://api.github.com/repos/${env.GITHUB_OWNER}/${env.GITHUB_REPO}/actions/workflows/ci.yml/dispatches \\
+                        -d '${body}'
+                """
+            ).trim()
+
+            echo "Dispatch response: ${response}"
+
+            def json = readJSON text: response
+            result.runId = json.workflow_run_id?.toString()
+            result.runUrl = json.run_url?.toString()
+
+            if (!result.runId) {
+                error "❌ Response did not contain workflow_run_id"
+            }
+        } catch (Exception e) {
+            error "❌ Error triggering GitHub Actions: ${e.getMessage()}"
+        }
+    }
+
+    echo "Workflow triggered, Run ID: ${result.runId}, Run URL: ${result.runUrl}"
+    return result
+}
+
+def createAndPushTag() {
+    def tagName = "${params.MODULE}-v${params.VERSION}"
+
+    sh """
+    git config user.email "jenkins@ci.local"
+    git config user.name "Jenkins CI"
+    
+    if git tag -l | grep -q "^${tagName}\$"; then
+        echo "Tag ${tagName} already exists, removing old tag"
+        git tag -d ${tagName}
+        git push origin :refs/tags/${tagName} || true
+    fi
+    
+    git tag -a ${tagName} -m "Release ${tagName} triggered by Jenkins"
+    git push origin ${tagName}
+"""
+
+    echo "Tag ${tagName} created and pushed"
+    echo "GitHub Actions will be triggered by tag push"
+}
+
+def waitForGithubActions(String runId, String runUrl) {
+    def maxRetries = 240
+    def retryCount = 0
+    def waitTime = 15
+    def buildSuccess = false
+
+    echo "Monitoring workflow run: https://github.com/${env.GITHUB_OWNER}/${env.GITHUB_REPO}/actions/runs/${runId}"
+
+    withCredentials([string(credentialsId: 'GITHUB_TOKEN', variable: 'GITHUB_TOKEN')]) {
+        while (retryCount < maxRetries) {
+            retryCount++
+            echo "Checking GitHub Actions status... (attempt ${retryCount}/${maxRetries})"
+
+            def response = sh(
+                    returnStdout: true,
+                    script: """
+                    curl -s -L \\
+                        -H "Accept: application/vnd.github.v3+json" \\
+                        -H "Authorization: token \${GITHUB_TOKEN}" \\
+                        "${runUrl}"
+                """
+            ).trim()
+
+            def json = readJSON text: response
+            def status = json.status          // queued | in_progress | completed
+            def conclusion = json.conclusion  // success | failure | cancelled | null
+
+            echo "Run ID: ${runId}, Status: ${status}, Conclusion: ${conclusion}"
+
+            if (status == 'completed') {
+                if (conclusion == 'success') {
+                    echo "✅ GitHub Actions build succeeded!"
+                    buildSuccess = true
+                    break
+                } else {
+                    error "❌ GitHub Actions build failed with conclusion: ${conclusion}"
+                }
+            }
+
+            sleep time: waitTime, unit: 'SECONDS'
+        }
+    }
+
+    if (!buildSuccess) {
+        error "❌ Monitor timeout: GitHub Actions did not complete within the time limit."
+    }
+}
+
+def rollingDeploy() {
+    def serviceName = getModuleServiceName(params.MODULE)
+    def serviceNameUp = serviceName.toUpperCase()
+    def port = getModulePort(params.MODULE)
+    def EUREKA_URL = getEurekaUrl(params.ENVIRONMENT)
+    def SERVER_HOST = params.SERVER_HOST
+    def SERVER_USER = getServerUser()
+    def SERVER_B_HOST = params.SERVER_B_HOST
+    def waitAfterDown = resolveWaitTimeAfterDown()
+    echo "下线后等待时间: ${waitAfterDown}s (环境=${params.ENVIRONMENT}, 模块=${params.MODULE})"
+    // 截取 server 的第一个点前的部分作为实例ID
+    def serverAId = SERVER_HOST.split('\\.')[0]
+    // 截取 server 的第一个点前的部分作为实例ID
+    def serverBId = SERVER_B_HOST.split('\\.')[0]
+
+    // Step 1-3: Deploy to Server B and verify
+    echo "========== Step 1-3: Deploy and verify Server B =========="
+    deployAndVerify(SERVER_B_HOST, "${params.MODULE}_bak", serviceNameUp, EUREKA_URL, 2)
+
+    sleep time: 60, unit: 'SECONDS'
+
+    // Step 4-5: Mark Server A as DOWN and wait
+    echo "========== Step 4-5: Mark Server A as DOWN =========="
+    markServerAsDown(serverAId, serviceName, port, EUREKA_URL, serviceNameUp, 1)
+
+    sleep time: waitAfterDown, unit: 'SECONDS'
+
+    // Step 6-8: Deploy to Server A and verify
+    echo "========== Step 6-8: Deploy and verify Server A =========="
+    deployAndVerify(SERVER_HOST, params.MODULE, serviceNameUp, EUREKA_URL, 2)
+
+    sleep time: 60, unit: 'SECONDS'
+
+    // Step 9-10: Mark Server B as DOWN and wait
+    echo "========== Step 9-10: Mark Server B as DOWN =========="
+    markServerAsDown(serverBId, serviceName, port, EUREKA_URL, serviceNameUp, 1)
+
+    sleep time: waitAfterDown, unit: 'SECONDS'
+
+    // Step 11: Stop Server B container
+    echo "========== Step 11: Stop Server B container =========="
+    sshCommand remote: createRemote(SERVER_USER, SERVER_B_HOST), command: """
+        cd /opt/java-apps/${params.MODULE}_bak
+        sudo docker compose down
+    """
+}
+
+def deployAndVerify(String serverHost, String dir, String serviceNameUp, String eurekaUrl, int expectedInstances) {
+    def version = params.VERSION
+    def imageTag = getImage()
+    def pullOption = params.ALWAYS_PULL_IMAGE == 'true' ? '--pull always' : ''
+    def serverUser = getServerUser()
+
+    def needDeploy
+    def currentImage = null
+    if (params.ALWAYS_PULL_IMAGE == 'true') {
+        needDeploy = true
+    } else {
+        needDeploy = version == "develop"
+        if (!needDeploy) {
+            // 判断是否已经是最新的镜像的容器,如果是则直接返回
+            currentImage = sshCommand remote: createRemote(serverUser, serverHost), command: """
+        cd /opt/java-apps/${dir}
+        sudo docker compose ps --format '{{.Image}}' | head -n 1
+        """
+            needDeploy = currentImage?.trim() != imageTag
+        }
+    }
+
+
+    if (needDeploy) {
+        // Deploy
+        sshCommand remote: createRemote(serverUser, serverHost), command: """
+        cd /opt/java-apps/${dir}
+        sudo sed -i "s|image:.*|image: ${imageTag}|" docker-compose.yml
+        sudo docker compose up -d ${pullOption}
+        """
+        echo "Current image: ${currentImage?.trim()}, target image: ${imageTag}, proceeding with deployment"
+    }
+
+    // Wait for registration
+    waitForEurekaInstances(serviceNameUp, expectedInstances, eurekaUrl)
+
+    // Verify health
+    def logs = sshCommand remote: createRemote(serverUser, serverHost), command: """
+                    cd /opt/java-apps/${dir}
+                    sudo docker compose logs --tail 30
+                """
+    echo "Server ${serverHost} logs:\n${logs}"
+}
+
+def markServerAsDown(String serverId, String serviceName, int port, String eurekaUrl, String serviceNameUp, int expectedInstances) {
+    sh """
+        curl -X PUT "${eurekaUrl}/apps/${serviceNameUp}/${serverId}:${serviceName}:${port}/status?value=DOWN" \
+            -H "Accept: application/json" \
+            -H "Content-Type: application/json" || true
+    """
+    sleep time: 5, unit: 'SECONDS'
+    waitForEurekaInstances(serviceNameUp, expectedInstances, eurekaUrl)
+}
+
+static def createRemote(String user, String host) {
+    return [
+            name         : "remote-${host.hashCode()}",
+            host         : host,
+            user         : user,
+            identityFile : "/var/jenkins_home/ssh/id_rsa_${user}",
+            allowAnyHosts: true
+    ]
+}
+
+def waitForEurekaInstances(String serviceName, int expectedCount, String eurekaUrl) {
+    def maxRetries = 40
+    def retryCount = 0
+    def success = false
+
+    def upCount = 0
+    while (retryCount < maxRetries) {
+        retryCount++
+
+        upCount = sh(
+                returnStdout: true,
+                script: "curl -s -H 'Accept: application/json' '${eurekaUrl}/apps/${serviceName}' | grep -o '\"status\":\"UP\"' | wc -l || echo '0'"
+        ).trim().toInteger()
+
+        if (upCount >= expectedCount) {
+            echo "✅ Service has ${upCount} UP instances (expected: ${expectedCount})"
+            success = true
+            break
+        }
+
+        echo "Waiting... (${retryCount}/${maxRetries}) UP instances: ${upCount}, expected: ${expectedCount}"
+        sleep time: 10, unit: 'SECONDS'
+    }
+
+    if (!success) {
+        error "❌ Eureka registration timeout. Current UP instances: ${upCount}, expected: ${expectedCount}"
+    }
+}
+
+static def getModulePort(String module) {
+    switch (module) {
+        case 'declaration-server':
+            return 8501
+        case 'addr-server':
+            return 8001
+        case 'setting-server':
+            return 9501
+        case 'message-server':
+            return 14001
+        case 'warehouse-server':
+            return 8901
+        case 'operation-data':
+            return 13001
+        case 'hscode-server':
+            return 8601
+        case 'category-server':
+            return 8401
+        case 'waybill':
+            return 8701
+        case 'sysafariview-server':
+            return 9301
+        case 'job-allocation':
+            return 12001
+        case 'file-sy-server':
+            return 9001
+        case 'kt-util':
+            return 9709
+        default:
+            return 8080
+    }
+}
+
+static def getModuleServiceName(String module) {
+    switch (module) {
+        case 'declaration-server':
+            return 'declaration-service'
+        case 'addr-server':
+            return 'address-service'
+        case 'setting-server':
+            return 'setting-server'
+        case 'message-server':
+            return 'message-service'
+        case 'warehouse-server':
+            return 'warehouse-service'
+        case 'operation-data':
+            return 'operation-data'
+        case 'hscode-server':
+            return 'hscode-service'
+        case 'category-server':
+            return 'category-service'
+        case 'waybill':
+            return 'waybill-service'
+        case 'sysafariview-server':
+            return 'sysafariview-service'
+        case 'job-allocation':
+            return 'job-allocation'
+        case 'file-sy-server':
+            return 'file-service'
+        case 'kt-util':
+            return 'kt-util'
+        default:
+            return module
+    }
+}
+
+static def getEurekaUrl(String environment) {
+    if (environment == "pro") {
+        return "http://eureka.pro.sysafari.com/eureka"
+    }
+    if (environment == "dev") {
+        return "http://thinkserver-asl:8801/eureka"
+    }
+    return "http://eureka.dev.sysafari.cn/eureka"
+}
+
+def getServerUser() {
+    return env.BUILD_USER ?: 'sunchao'
+}
+
+def sendDingTalkNotification(String status, String message) {
+    withCredentials([string(credentialsId: 'DINGTALK_WEBHOOK', variable: 'WEBHOOK_URL')]) {
+        def title = status == 'success' ? '✅ 构建CI/CD成功' : '❌ 构建CI/CD失败'
+
+        def body = """{
+            "msgtype": "markdown",
+            "markdown": {
+                "title": "${title}",
+                "text": "${message}"
+            },
+            "at": {
+                "isAtAll": false
+            }
+        }"""
+
+        sh """
+            curl -X POST \${WEBHOOK_URL} \\
+                -H 'Content-Type: application/json' \\
+                -d '${body}'
+        """
+        echo "DingTalk notification sent: ${status}"
+    }
+}
+
+def getImage() {
+    if (params.ENVIRONMENT == "pro") {
+        return "registry.eu-central-1.aliyuncs.com/asl/sysafari-server:${params.MODULE}-${params.VERSION}"
+    } else {
+        return "registry.cn-shanghai.aliyuncs.com/asl/sysafari-server:${params.MODULE}-${params.VERSION}"
+    }
+}
+
+def resolveWaitTimeAfterDown() {
+    def custom = params.WAIT_TIME_AFTER_DOWN?.trim()
+    if (custom) {
+        try {
+            def val = custom as int
+            if (val > 0) {
+                echo "使用自定义下线等待时间: ${val}s"
+                return val
+            }
+        } catch (Exception ignored) {
+            echo "⚠️ 自定义值 '${custom}' 无效，将使用默认值"
+        }
+    }
+
+    if (params.ENVIRONMENT == "test" || params.ENVIRONMENT == "dev") {
+        return 30
+    }
+
+    if (params.MODULE == "declaration-server") {
+        return 120
+    }
+
+    return 60
+}
